@@ -341,14 +341,6 @@
         <button class="btn-primary" id="play-btn" disabled>Play</button>
       </section>
 
-      <!-- ===================== SCREEN: LOCKED (already attempted, unfinished) ===================== -->
-      <section id="screen-locked" class="hidden">
-        <h1 class="title">🤔 FRIDAY CYBER RIDDLE 🤔</h1>
-        <div class="instructions">
-          <div class="line"><span class="bullet">›</span><span id="locked-message">Your one attempt this week has already been used.</span></div>
-        </div>
-      </section>
-
       <!-- ===================== SCREEN: GAME ===================== -->
       <section id="screen-game" class="hidden">
         <div class="hud">
@@ -384,13 +376,6 @@
           <div class="lb-title">THIS WEEK — FASTEST SOLVES</div>
           <div id="lb-week-list"></div>
         </div>
-
-        <div class="leaderboard">
-          <div class="lb-title">ALL-TIME — FASTEST SOLVES</div>
-          <div id="lb-alltime-list"></div>
-        </div>
-
-        <div class="result-note" id="result-note"></div>
 
         <div class="result-actions">
           <button class="btn-secondary" id="share-btn">Share result</button>
@@ -581,7 +566,10 @@
     label.textContent = "RIDDLE: ";
     el.appendChild(label);
 
-    const paragraphs = text.split("\n");
+    // Riddle text may contain a real line-break character, or a literal
+    // two-character "\n" (which is what you get if you type backslash-n
+    // into the Firestore console's plain text editor) — treat both the same.
+    const paragraphs = text.replace(/\\n/g, "\n").split("\n");
     paragraphs.forEach((para, pIdx) => {
       const words = para.split(" ").filter(Boolean);
       let counter = 0;
@@ -600,7 +588,6 @@
       });
       if(pIdx < paragraphs.length - 1){
         el.appendChild(document.createElement("br"));
-        el.appendChild(document.createElement("br"));
       }
     });
   }
@@ -616,13 +603,12 @@
 
   // ---------- screen management ----------
   const screenIntro = document.getElementById("screen-intro");
-  const screenLocked = document.getElementById("screen-locked");
   const screenGame = document.getElementById("screen-game");
   const screenResult = document.getElementById("screen-result");
   const barStatus = document.getElementById("bar-status");
 
   function showScreen(el, status){
-    [screenIntro, screenLocked, screenGame, screenResult].forEach(s => s.classList.add("hidden"));
+    [screenIntro, screenGame, screenResult].forEach(s => s.classList.add("hidden"));
     el.classList.remove("hidden");
     if(status) barStatus.textContent = status;
   }
@@ -679,15 +665,30 @@
     rafId = requestAnimationFrame(tick);
   }
 
-  function startGame(){
+  function startGame(elapsedMs){
     showScreen(screenGame, "decrypt riddle.txt");
     answerInput.value = "";
     feedback.textContent = "";
     feedback.className = "feedback";
-    startTime = performance.now();
+    startTime = performance.now() - (elapsedMs || 0);
     running = true;
     tick();
     setTimeout(() => answerInput.focus(), 50);
+  }
+
+  async function resumeGame(lock){
+    // They started this week's riddle in an earlier page load but never
+    // finished it — put them back into the same riddle with the timer
+    // continuing from where they left off, rather than starting over or
+    // blocking them.
+    playerName = lock.name;
+    agentNameDisplay.textContent = playerName;
+    const config = await getRiddleConfig();
+    currentAnswer = config.answer;
+    currentRiddleNumber = config.number;
+    renderRiddleInto(document.getElementById("riddle-box"), config.text);
+    const elapsedMs = Date.now() - lock.startedAt;
+    startGame(elapsedMs);
   }
 
   function attemptAnswer(){
@@ -717,9 +718,7 @@
   // ---------- result screen ----------
   const resultTime = document.getElementById("result-time");
   const resultSub = document.getElementById("result-sub");
-  const resultNote = document.getElementById("result-note");
   const lbWeekList = document.getElementById("lb-week-list");
-  const lbAllTimeList = document.getElementById("lb-alltime-list");
   const shareBtn = document.getElementById("share-btn");
 
   async function finishGame(){
@@ -732,14 +731,14 @@
     showScreen(screenResult, "access granted");
     resultTime.textContent = fmtSeconds(finalSeconds);
     resultSub.textContent = "solved by " + playerName;
-    resultNote.textContent = "One attempt per week — next riddle unlocks " + formatResetDate(currentWeekId) + ".";
 
     const scores = await getScores();
     const weekScores = scores.filter(s => s.weekId === currentWeekId).sort((a, b) => a.time - b.time);
-    const allTimeScores = [...scores].sort((a, b) => a.time - b.time);
+    // All-time scores are still tracked in storage (see getScores()) even
+    // though the all-time leaderboard isn't shown right now — re-add a
+    // second renderLeaderboard(...) call here if you want it back later.
 
     renderLeaderboard(lbWeekList, weekScores);
-    renderLeaderboard(lbAllTimeList, allTimeScores);
   }
 
   function renderLeaderboard(container, scores){
@@ -769,18 +768,30 @@
 
   shareBtn.addEventListener("click", async () => {
     const numberLabel = currentRiddleNumber != null ? currentRiddleNumber : "?";
-    const msg = "Friday Cyber Riddle #" + numberLabel + " - " + finalSeconds + "s";
+    const secondsLabel = finalSeconds + (finalSeconds === 1 ? " second" : " seconds");
+    const msg = "Friday Cyber Riddle #" + numberLabel + " - " + secondsLabel;
+
     try{
-      if(navigator.share){
-        await navigator.share({ text: msg });
-      }else{
-        await navigator.clipboard.writeText(msg);
-        shareBtn.textContent = "Copied!";
-        setTimeout(() => shareBtn.textContent = "Share result", 1600);
-      }
+      await navigator.clipboard.writeText(msg);
+      shareBtn.textContent = "Copied!";
     }catch(e){
-      // user cancelled share sheet or clipboard blocked — ignore quietly
+      // Clipboard API unavailable (older browser, or an insecure/non-https
+      // context) — fall back to a manual copy via a temporary textarea.
+      try{
+        const ta = document.createElement("textarea");
+        ta.value = msg;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        shareBtn.textContent = "Copied!";
+      }catch(e2){
+        shareBtn.textContent = "Couldn't copy";
+      }
     }
+    setTimeout(() => shareBtn.textContent = "Share result", 1600);
   });
 
   // ---------- confetti / fireworks ----------
@@ -870,9 +881,7 @@
         finalSeconds = lock.time;
         await renderResultScreenNoConfetti();
       }else{
-        document.getElementById("locked-message").textContent =
-          "Your one attempt this week has already been used. Come back " + formatResetDate(currentWeekId) + " for a new riddle.";
-        showScreen(screenLocked, "attempt already used");
+        await resumeGame(lock);
       }
     }else{
       showScreen(screenIntro, "init game.exe");
@@ -887,12 +896,9 @@
     showScreen(screenResult, "access granted");
     resultTime.textContent = fmtSeconds(finalSeconds);
     resultSub.textContent = "solved by " + playerName;
-    resultNote.textContent = "One attempt per week — next riddle unlocks " + formatResetDate(currentWeekId) + ".";
     const scores = await getScores();
     const weekScores = scores.filter(s => s.weekId === currentWeekId).sort((a, b) => a.time - b.time);
-    const allTimeScores = [...scores].sort((a, b) => a.time - b.time);
     renderLeaderboard(lbWeekList, weekScores);
-    renderLeaderboard(lbAllTimeList, allTimeScores);
   }
 
 })();
