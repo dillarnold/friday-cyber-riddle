@@ -21,15 +21,18 @@
   2) THE RIDDLE. With FIREBASE_ENABLED = false, edit the DEFAULT_RIDDLE
      object in the "CONFIG ADAPTER" section below and redeploy. With it
      true, the riddle instead comes from a "config/currentRiddle" document
-     in Firestore, so you can change it any week from the Firebase console
+     in Firestore, so you can change it any time from the Firebase console
      with no redeploy.
 
-  3) ONE ATTEMPT PER WEEK. This is enforced client-side via localStorage
-     (see WEEKLY LOCK below). It stops casual replays on the same browser,
-     but someone using a private/incognito window or a different browser
-     can still get a second attempt — there's no way around that without a
-     real backend. If that matters to you, the Firestore setup above can
-     also check "has this name already played this week?" server-side.
+  3) ONE ATTEMPT PER RIDDLE. This is enforced client-side via localStorage
+     (see PER-RIDDLE LOCK below), keyed on the riddle's "number" field —
+     not the calendar date, so a riddle can stay live for a day, a week, or
+     a month and the lock only resets once you actually publish a new
+     riddleNumber. It stops casual replays on the same browser, but someone
+     using a private/incognito window or a different browser can still get
+     a second attempt — there's no way around that without a real backend.
+     If that matters to you, the Firestore setup above can also check "has
+     this name already played this riddle?" server-side.
   ============================================================================
 -->
 
@@ -347,7 +350,7 @@
         <h1 class="title">🤔 FRIDAY CYBER RIDDLE 🤔</h1>
         <div class="leaderboard">
           <div class="lb-title">LEADERBOARD — FASTEST SOLVES</div>
-          <div id="lb-standalone-list"></div>
+          <div id="lb-standalone-current-list"></div>
         </div>
         <button class="btn-secondary" id="leaderboard-back-btn" style="width:100%;">Back</button>
       </section>
@@ -385,7 +388,7 @@
 
         <div class="leaderboard">
           <div class="lb-title">LEADERBOARD — FASTEST SOLVES</div>
-          <div id="lb-week-list"></div>
+          <div id="lb-current-list"></div>
         </div>
 
         <div class="result-actions">
@@ -453,7 +456,16 @@
     if(FIREBASE_ENABLED && db){
       try{
         const snap = await db.collection("scores").orderBy("time").get();
-        return snap.docs.map(d => d.data()); // { name, time, weekId, ts }
+        return snap.docs.map(d => {
+          const data = d.data();
+          // Scores saved before riddleNumber tagging was added don't have
+          // this field at all — treat them as riddle #1, since that's the
+          // only riddle that existed at the time they were earned. Also
+          // normalize the type, in case it was ever typed into Firestore
+          // as a string ("1") rather than a number (1).
+          data.riddleNumber = data.riddleNumber == null ? 1 : normalizeRiddleNumber(data.riddleNumber);
+          return data;
+        });
       }catch(e){
         console.error("Firestore read failed — showing an empty leaderboard instead:", e);
         return [];
@@ -461,21 +473,23 @@
     }
     try{
       const raw = localStorage.getItem(SCORES_KEY);
-      return raw ? JSON.parse(raw) : [];
+      const scores = raw ? JSON.parse(raw) : [];
+      scores.forEach(s => { s.riddleNumber = s.riddleNumber == null ? 1 : normalizeRiddleNumber(s.riddleNumber); });
+      return scores;
     }catch(e){ return []; }
   }
 
-  async function submitScore(name, time, weekId){
+  async function submitScore(name, time, riddleNumber){
     if(FIREBASE_ENABLED && db){
       try{
-        await db.collection("scores").add({ name, time, weekId, ts: Date.now() });
+        await db.collection("scores").add({ name, time, riddleNumber, ts: Date.now() });
       }catch(e){
         console.error("Firestore write failed — this score may not have been saved:", e);
       }
       return getScores();
     }
     const scores = await getScores();
-    scores.push({ name, time, weekId, ts: Date.now() });
+    scores.push({ name, time, riddleNumber, ts: Date.now() });
     try{ localStorage.setItem(SCORES_KEY, JSON.stringify(scores)); }catch(e){}
     return scores;
   }
@@ -488,52 +502,61 @@
      With FIREBASE_ENABLED = false, edit DEFAULT_RIDDLE below and redeploy.
 
      With it true, getRiddleConfig() instead reads the "config/currentRiddle"
-     document in Firestore, so you can change next week's riddle any time
-     from the Firebase console — no redeploy needed. Give that document the
-     same three fields as DEFAULT_RIDDLE: number, text, answer.
+     document in Firestore, so you can change the riddle any time from the
+     Firebase console — no redeploy needed. Give that document these fields:
+       number  — a number, e.g. 2
+       text    — the riddle text (use a literal \n for a line break)
+       answers — an array of acceptable answers, e.g. ["honeypot", "honey pot"]
+     (A single "answer" string field also still works, for a riddle with
+     just one acceptable answer — no need to use an array for that case.)
 
-     "answer" is matched case-insensitively and allows small typos.
+     Every answer is matched case-insensitively, ignores punctuation/spacing,
+     and forgives small typos — you don't need to list minor variants like
+     "Honeypot" vs "honeypot", just genuinely different acceptable wordings.
      ========================================================================== */
   const DEFAULT_RIDDLE = {
     number: 1,
     text: "I look like treasure, rich and sweet, a tempting server, primed to greet. Hackers creep in, certain they've won, but every keystroke that they make is done in full view of the eyes that wait, patient behind the golden gate. I'm not defense in the usual sense, I'm bait, and I profit from confidence.\nWhat piece of cybersecurity am I?",
-    answer: "honeypot"
+    answers: ["honeypot"]
   };
 
   async function getRiddleConfig(){
+    let config;
     if(FIREBASE_ENABLED && db){
       try{
         const doc = await db.collection("config").doc("currentRiddle").get();
-        return doc.exists ? doc.data() : DEFAULT_RIDDLE;
+        config = doc.exists ? doc.data() : DEFAULT_RIDDLE;
       }catch(e){
         console.error("Firestore config read failed — falling back to DEFAULT_RIDDLE:", e);
-        return DEFAULT_RIDDLE;
+        config = DEFAULT_RIDDLE;
       }
+    }else{
+      config = DEFAULT_RIDDLE;
     }
-    return DEFAULT_RIDDLE;
+    const answers = Array.isArray(config.answers) && config.answers.length
+      ? config.answers
+      : (config.answer != null ? [config.answer] : []);
+    return { ...config, number: normalizeRiddleNumber(config.number), answers };
   }
   /* ======================== END CONFIG ADAPTER =========================== */
 
 
   /* ==========================================================================
-     WEEKLY LOCK — one attempt per week, per browser (see caveat at top of file)
+     PER-RIDDLE LOCK — one attempt per riddle, per browser (see caveat at top
+     of file). Keyed on riddleNumber rather than the calendar date, so a
+     riddle can stay live for a day, a week, or a month — the lock only
+     resets when you actually publish a new riddleNumber, not on a schedule.
      ========================================================================== */
-  const LOCK_KEY = "fridayCyberRiddle.lock.v2";
-  const REF_FRIDAY_UTC = Date.UTC(2024, 0, 5); // a known Friday 00:00 UTC
-  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+  const LOCK_KEY = "fridayCyberRiddle.lock.v3";
 
-  function getWeekId(date){
-    const diff = date.getTime() - REF_FRIDAY_UTC;
-    return "W" + Math.floor(diff / WEEK_MS);
+  // Firestore (and a hand-typed console field) can hand back a riddleNumber
+  // as either a number or a numeric string — normalize so "1" and 1 compare
+  // as equal everywhere we check riddleNumber.
+  function normalizeRiddleNumber(n){
+    const num = Number(n);
+    return Number.isFinite(num) ? num : n;
   }
-  function weekStartMs(weekId){
-    const n = parseInt(weekId.slice(1), 10);
-    return REF_FRIDAY_UTC + n * WEEK_MS;
-  }
-  function formatResetDate(weekId){
-    const nextStart = weekStartMs(weekId) + WEEK_MS;
-    return new Date(nextStart).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-  }
+
   function readLock(){
     try{
       const raw = localStorage.getItem(LOCK_KEY);
@@ -543,7 +566,7 @@
   function writeLock(lock){
     try{ localStorage.setItem(LOCK_KEY, JSON.stringify(lock)); }catch(e){}
   }
-  /* ========================= END WEEKLY LOCK ============================= */
+  /* ========================= END PER-RIDDLE LOCK ========================== */
 
 
   // ---------- answer checking ----------
@@ -566,13 +589,16 @@
     return dp[m][n];
   }
 
-  function isCloseEnough(input, answer){
+  function isCloseEnough(input, answers){
     const norm = normalize(input);
-    const target = normalize(answer);
     if(!norm) return false;
-    if(norm === target) return true;
-    if(norm.includes(target)) return true;
-    return levenshtein(norm, target) <= 2;
+    return answers.some(answer => {
+      const target = normalize(answer);
+      if(!target) return false;
+      if(norm === target) return true;
+      if(norm.includes(target)) return true;
+      return levenshtein(norm, target) <= 2;
+    });
   }
 
   // ---------- riddle rendering (with invisible anti-AI decoys) ----------
@@ -645,9 +671,8 @@
   const agentNameDisplay = document.getElementById("agent-name-display");
 
   let playerName = "";
-  let currentAnswer = "";
+  let currentAnswers = [];
   let currentRiddleNumber = null;
-  let currentWeekId = getWeekId(new Date());
 
   nameInput.addEventListener("input", () => {
     playerName = nameInput.value.trim();
@@ -662,14 +687,15 @@
     try{
       agentNameDisplay.textContent = playerName;
 
-      // Lock this week's attempt immediately, before the riddle even loads,
-      // so refreshing mid-attempt can't be used to reset the clock.
-      writeLock({ weekId: currentWeekId, name: playerName, completed: false, time: null, startedAt: Date.now() });
-
       const config = await getRiddleConfig();
-      currentAnswer = config.answer;
+      currentAnswers = config.answers;
       currentRiddleNumber = config.number;
       renderRiddleInto(document.getElementById("riddle-box"), config.text);
+
+      // Lock this riddle now that we know which one it is, so refreshing
+      // mid-attempt can't be used to reset the clock, and a reload later
+      // can still tell which riddle this attempt belongs to.
+      writeLock({ name: playerName, completed: false, time: null, startedAt: Date.now(), riddleNumber: currentRiddleNumber });
 
       startGame();
     }catch(e){
@@ -680,19 +706,23 @@
 
   const viewLeaderboardBtn = document.getElementById("view-leaderboard-btn");
   const leaderboardBackBtn = document.getElementById("leaderboard-back-btn");
-  const lbStandaloneList = document.getElementById("lb-standalone-list");
+  const lbStandaloneCurrentList = document.getElementById("lb-standalone-current-list");
 
   viewLeaderboardBtn.addEventListener("click", async () => {
     showScreen(screenLeaderboard, "leaderboard.log");
     try{
+      if(currentRiddleNumber == null){
+        const config = await getRiddleConfig();
+        currentRiddleNumber = config.number;
+      }
       const scores = await getScores();
-      const allScores = scores.sort((a, b) => a.time - b.time);
+      const currentScores = scores.filter(s => s.riddleNumber === currentRiddleNumber).sort((a, b) => a.time - b.time);
       // No highlight here — nobody has just finished a run when browsing
       // the leaderboard from the home screen.
-      renderLeaderboard(lbStandaloneList, allScores, null, null);
+      renderLeaderboard(lbStandaloneCurrentList, currentScores, null, null);
     }catch(e){
       console.error("Couldn't load the leaderboard:", e);
-      lbStandaloneList.innerHTML = '<div class="lb-empty">couldn\'t load the leaderboard right now.</div>';
+      lbStandaloneCurrentList.innerHTML = '<div class="lb-empty">couldn\'t load the leaderboard right now.</div>';
     }
   });
 
@@ -737,7 +767,7 @@
     playerName = lock.name;
     agentNameDisplay.textContent = playerName;
     const config = await getRiddleConfig();
-    currentAnswer = config.answer;
+    currentAnswers = config.answers;
     currentRiddleNumber = config.number;
     renderRiddleInto(document.getElementById("riddle-box"), config.text);
     const elapsedMs = Date.now() - lock.startedAt;
@@ -751,7 +781,7 @@
       feedback.className = "feedback err";
       return;
     }
-    if(isCloseEnough(val, currentAnswer)){
+    if(isCloseEnough(val, currentAnswers)){
       running = false;
       cancelAnimationFrame(rafId);
       finalSeconds = Math.floor((performance.now() - startTime) / 1000);
@@ -771,12 +801,12 @@
   // ---------- result screen ----------
   const resultTime = document.getElementById("result-time");
   const resultSub = document.getElementById("result-sub");
-  const lbWeekList = document.getElementById("lb-week-list");
+  const lbCurrentList = document.getElementById("lb-current-list");
   const shareBtn = document.getElementById("share-btn");
 
   async function finishGame(){
-    writeLock({ weekId: currentWeekId, name: playerName, completed: true, time: finalSeconds, completedAt: Date.now() });
-    await submitScore(playerName, finalSeconds, currentWeekId);
+    writeLock({ name: playerName, completed: true, time: finalSeconds, completedAt: Date.now(), riddleNumber: currentRiddleNumber });
+    await submitScore(playerName, finalSeconds, currentRiddleNumber);
     await renderResultScreen();
   }
 
@@ -786,9 +816,9 @@
     resultSub.textContent = "solved by " + playerName;
 
     const scores = await getScores();
-    const allScores = scores.sort((a, b) => a.time - b.time);
+    const currentScores = scores.filter(s => s.riddleNumber === currentRiddleNumber).sort((a, b) => a.time - b.time);
 
-    renderLeaderboard(lbWeekList, allScores, playerName, finalSeconds);
+    renderLeaderboard(lbCurrentList, currentScores, playerName, finalSeconds);
   }
 
   function renderLeaderboard(container, scores, highlightName, highlightTime){
@@ -922,10 +952,14 @@
     burstConfetti();
   };
 
-  // ---------- boot: check weekly lock before showing anything ----------
+  // ---------- boot: check the per-riddle lock before showing anything ----------
   (async function init(){
+    const config = await getRiddleConfig();
+    currentAnswers = config.answers;
+    currentRiddleNumber = config.number;
+
     const lock = readLock();
-    if(lock && lock.weekId === currentWeekId){
+    if(lock && lock.riddleNumber === currentRiddleNumber){
       playerName = lock.name;
       if(lock.completed){
         finalSeconds = lock.time;
@@ -939,16 +973,12 @@
   })();
 
   async function renderResultScreenNoConfetti(){
-    if(currentRiddleNumber == null){
-      const config = await getRiddleConfig();
-      currentRiddleNumber = config.number;
-    }
     showScreen(screenResult, "access granted");
     resultTime.textContent = fmtSeconds(finalSeconds);
     resultSub.textContent = "solved by " + playerName;
     const scores = await getScores();
-    const allScores = scores.sort((a, b) => a.time - b.time);
-    renderLeaderboard(lbWeekList, allScores, playerName, finalSeconds);
+    const currentScores = scores.filter(s => s.riddleNumber === currentRiddleNumber).sort((a, b) => a.time - b.time);
+    renderLeaderboard(lbCurrentList, currentScores, playerName, finalSeconds);
   }
 
 })();
